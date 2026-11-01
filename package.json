@@ -1,0 +1,16 @@
+{
+  "name": "livemystery-ai",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A real-time Twitch chat mystery game for streamers and their communities.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node server/index.js",
+    "check": "node --check server/index.js && node --check server/game.js && node --check server/narration.js && node --check server/twitch.js && node --check public/app.js",
+    "test": "node --test"
+  }
+}
