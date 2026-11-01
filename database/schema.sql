@@ -1,6 +1,20 @@
--- LiveMystery Netlify / Neon PostgreSQL schema.
+-- LiveMystery current schema reference.
+-- database/migrations/001_initial.sql is the immutable initial migration.
+-- Never edit an applied migration; add a new numbered migration for every change.
+-- Keep this file synchronized with the cumulative result of all migrations.
 -- Apply this manually only after the Netlify Functions migration is approved.
 -- This file contains schema only: never place credentials, tokens, or encryption keys here.
+
+-- Migration ledger. 002_schema_migrations.sql is the versioned record for this
+-- table. The runner creates the same table within its first atomic migration so
+-- it can record 001_initial.sql; do not manually add or alter ledger rows.
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version TEXT PRIMARY KEY,
+  checksum CHAR(64) NOT NULL,
+  applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CHECK (version ~ '^[0-9]{3,}_[a-z0-9][a-z0-9_-]*$'),
+  CHECK (checksum ~ '^[0-9a-f]{64}$')
+);
 
 -- The application encrypts OAuth tokens before writing them. Use an authenticated
 -- encryption algorithm (AES-256-GCM), a fresh nonce per ciphertext, and a key
