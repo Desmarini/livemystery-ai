@@ -49,7 +49,9 @@ const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   if (req.method === 'POST' && (url.pathname.startsWith('/api/') || url.pathname === '/auth/twitch/logout')) {
     const origin = req.headers.origin;
-    if (origin && origin !== `http://${req.headers.host}`) return json(res, 403, { error: 'Requests must come from this local LiveMystery page.' });
+    const forwardedProtocol = String(req.headers['x-forwarded-proto'] || 'http').split(',')[0].trim();
+    const requestOrigin = `${forwardedProtocol}://${req.headers.host}`;
+    if (origin && origin !== requestOrigin) return json(res, 403, { error: 'Requests must come from this LiveMystery page.' });
   }
   if (req.method === 'GET' && url.pathname === '/auth/twitch') return twitch.start(res);
   if (req.method === 'GET' && url.pathname === '/auth/twitch/callback') return twitch.callback(req, res, url);
@@ -88,8 +90,8 @@ const server = createServer(async (req, res) => {
   createReadStream(file).pipe(res);
 });
 
-server.listen(port, '127.0.0.1', () => {
+server.listen(port, '0.0.0.0', () => {
   console.log(`LiveMystery AI is running at http://localhost:${server.address().port}`);
   console.log(twitch.configured ? 'Twitch OAuth is configured.' : 'Twitch OAuth is not configured; add the required values to .env and restart.');
-  console.log('The server binds to localhost; Twitch tokens remain in server memory.');
+  console.log('The server accepts network traffic on all interfaces; Twitch tokens remain in server memory.');
 });
