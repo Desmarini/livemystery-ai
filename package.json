@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node server/index.js",
     "dev": "node server/index.js",
-    "check": "node --check server/index.js && node --check server/game.js && node --check server/narration.js && node --check server/twitch.js && node --check public/app.js",
+    "check": "node --check server/index.js && node --check server/game.js && node --check server/narration.js && node --check server/twitch.js && node --check public/app.js && node --check netlify/functions/health.mjs",
     "test": "node --test"
   }
 }

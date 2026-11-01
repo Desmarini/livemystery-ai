@@ -1,0 +1,247 @@
+-- LiveMystery Netlify / Neon PostgreSQL schema.
+-- Apply this manually only after the Netlify Functions migration is approved.
+-- This file contains schema only: never place credentials, tokens, or encryption keys here.
+
+-- The application encrypts OAuth tokens before writing them. Use an authenticated
+-- encryption algorithm (AES-256-GCM), a fresh nonce per ciphertext, and a key
+-- held only in a Netlify Function environment variable. Ciphertext and its GCM
+-- authentication tag are stored in separate encoded fields and must be verified
+-- before plaintext is used. The key version enables rotation without storing the
+-- key itself in PostgreSQL.
+CREATE TABLE IF NOT EXISTS twitch_authorizations (
+  broadcaster_user_id TEXT PRIMARY KEY,
+  broadcaster_login TEXT NOT NULL,
+  access_token_ciphertext TEXT NOT NULL,
+  access_token_nonce TEXT NOT NULL,
+  access_token_auth_tag TEXT NOT NULL,
+  refresh_token_ciphertext TEXT NOT NULL,
+  refresh_token_nonce TEXT NOT NULL,
+  refresh_token_auth_tag TEXT NOT NULL,
+  token_encryption_algorithm TEXT NOT NULL DEFAULT 'aes-256-gcm',
+  token_encryption_key_version SMALLINT NOT NULL DEFAULT 1 CHECK (token_encryption_key_version > 0),
+  access_token_expires_at TIMESTAMPTZ NOT NULL,
+  granted_scopes TEXT[] NOT NULL,
+  revoked_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CHECK (broadcaster_user_id <> ''),
+  CHECK (broadcaster_login <> ''),
+  CHECK (token_encryption_algorithm = 'aes-256-gcm'),
+  CHECK (access_token_ciphertext <> '' AND access_token_nonce <> '' AND access_token_auth_tag <> ''),
+  CHECK (refresh_token_ciphertext <> '' AND refresh_token_nonce <> '' AND refresh_token_auth_tag <> '')
+);
+
+-- Store only a hash of the random OAuth state value.
+-- Mark the row consumed in the same transaction as the token exchange result.
+CREATE TABLE IF NOT EXISTS oauth_sessions (
+  oauth_state_hash TEXT PRIMARY KEY,
+  redirect_uri TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  consumed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CHECK (oauth_state_hash <> ''),
+  CHECK (redirect_uri <> '')
+);
+
+CREATE INDEX IF NOT EXISTS oauth_sessions_active_expiry_idx
+  ON oauth_sessions (expires_at)
+  WHERE consumed_at IS NULL;
+
+-- Store only a hash of the browser session ID.
+CREATE TABLE IF NOT EXISTS app_sessions (
+  session_id_hash TEXT PRIMARY KEY,
+  broadcaster_user_id TEXT NOT NULL REFERENCES twitch_authorizations (broadcaster_user_id) ON DELETE CASCADE,
+  expires_at TIMESTAMPTZ NOT NULL,
+  revoked_at TIMESTAMPTZ,
+  last_seen_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CHECK (session_id_hash <> '')
+);
+
+CREATE INDEX IF NOT EXISTS app_sessions_active_broadcaster_idx
+  ON app_sessions (broadcaster_user_id, expires_at)
+  WHERE revoked_at IS NULL;
+
+-- One game state document per broadcaster.
+CREATE TABLE IF NOT EXISTS game_states (
+  broadcaster_user_id TEXT PRIMARY KEY REFERENCES twitch_authorizations (broadcaster_user_id) ON DELETE CASCADE,
+  state JSONB NOT NULL CHECK (jsonb_typeof(state) = 'object'),
+  state_schema_version SMALLINT NOT NULL DEFAULT 1 CHECK (state_schema_version > 0),
+  revision BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Store Twitch subscription metadata.
+CREATE TABLE IF NOT EXISTS eventsub_subscriptions (
+  subscription_id TEXT PRIMARY KEY,
+  broadcaster_user_id TEXT NOT NULL REFERENCES twitch_authorizations (broadcaster_user_id) ON DELETE CASCADE,
+  subscription_type TEXT NOT NULL,
+  subscription_version TEXT NOT NULL,
+  condition JSONB NOT NULL CHECK (jsonb_typeof(condition) = 'object'),
+  transport TEXT NOT NULL CHECK (transport IN ('webhook', 'websocket')),
+  callback_url TEXT,
+  webhook_secret_key_version SMALLINT CHECK (webhook_secret_key_version > 0),
+  twitch_status TEXT NOT NULL CHECK (twitch_status <> ''),
+  lifecycle_state TEXT NOT NULL DEFAULT 'pending'
+    CHECK (lifecycle_state IN ('pending', 'active', 'revoked', 'failed', 'disabled')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CHECK (
+    (transport = 'webhook'
+      AND callback_url IS NOT NULL
+      AND callback_url <> ''
+      AND callback_url LIKE 'https://%'
+      AND webhook_secret_key_version IS NOT NULL)
+    OR
+    (transport = 'websocket'
+      AND callback_url IS NULL
+      AND webhook_secret_key_version IS NULL)
+  )
+);
+
+CREATE INDEX IF NOT EXISTS eventsub_subscriptions_broadcaster_idx
+  ON eventsub_subscriptions (broadcaster_user_id, subscription_type);
+
+CREATE UNIQUE INDEX IF NOT EXISTS eventsub_active_subscription_idx
+  ON eventsub_subscriptions (broadcaster_user_id, subscription_type, transport)
+  WHERE lifecycle_state IN ('pending', 'active');
+
+-- Twitch may retry webhook notifications.
+-- A callback verification can arrive before subscription metadata is stored,
+-- so subscription_id must be nullable.
+-- Recovery workers must terminate a stale fifth attempt as failed.
+CREATE TABLE IF NOT EXISTS eventsub_messages (
+  message_id TEXT PRIMARY KEY,
+  subscription_id TEXT
+    REFERENCES eventsub_subscriptions (subscription_id)
+    ON DELETE SET NULL,
+  message_type TEXT NOT NULL
+    CHECK (message_type IN ('notification', 'webhook_callback_verification', 'revocation')),
+  processing_status TEXT NOT NULL DEFAULT 'received'
+    CHECK (processing_status IN ('received', 'processing', 'processed', 'ignored', 'failed')),
+  received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  processing_started_at TIMESTAMPTZ,
+  processed_at TIMESTAMPTZ,
+  attempt_count INTEGER NOT NULL DEFAULT 0
+    CHECK (attempt_count BETWEEN 0 AND 5),
+  failure_code TEXT,
+  CHECK (
+    (processing_status IN ('processed', 'ignored', 'failed'))
+    = (processed_at IS NOT NULL)
+  ),
+  CHECK (processing_status <> 'failed' OR failure_code IS NOT NULL),
+  CHECK (processing_status <> 'processing' OR processing_started_at IS NOT NULL),
+  CHECK (processing_status <> 'received' OR attempt_count < 5),
+  CHECK (processing_status <> 'processing' OR attempt_count BETWEEN 1 AND 5),
+  CHECK (processed_at IS NULL OR processed_at >= received_at)
+);
+
+-- Recovery worker scans received and processing events.
+-- At attempt five, stale processing rows must become failed, never received.
+CREATE INDEX IF NOT EXISTS eventsub_messages_recovery_idx
+  ON eventsub_messages (processing_status, attempt_count, processing_started_at)
+  WHERE processing_status IN ('received', 'processing');
+
+-- Cooldown identities use Twitch chatter_user_id, not display names.
+CREATE TABLE IF NOT EXISTS chat_command_cooldowns (
+  broadcaster_user_id TEXT NOT NULL REFERENCES twitch_authorizations (broadcaster_user_id) ON DELETE CASCADE,
+  chatter_user_id TEXT NOT NULL,
+  last_command_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (broadcaster_user_id, chatter_user_id),
+  CHECK (broadcaster_user_id <> ''),
+  CHECK (chatter_user_id <> '')
+);
+
+-- Outbox delivery is at-least-once, not exactly-once.
+-- Workers claim rows with FOR UPDATE SKIP LOCKED and a lock token.
+-- Reclaim expired locks with one conditional UPDATE, incrementing attempt_count.
+-- If the resulting count reaches five, mark the row failed.
+-- Only the worker owning the matching, unexpired lock_token may mark it sent.
+CREATE TABLE IF NOT EXISTS chat_replies (
+  reply_id TEXT PRIMARY KEY,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  broadcaster_user_id TEXT NOT NULL REFERENCES twitch_authorizations (broadcaster_user_id) ON DELETE CASCADE,
+  source_event_message_id TEXT UNIQUE REFERENCES eventsub_messages (message_id) ON DELETE SET NULL,
+  message_body TEXT NOT NULL CHECK (char_length(message_body) BETWEEN 1 AND 500),
+  status TEXT NOT NULL DEFAULT 'queued'
+    CHECK (status IN ('queued', 'sending', 'sent', 'failed', 'suppressed')),
+  not_before TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  attempt_count INTEGER NOT NULL DEFAULT 0
+    CHECK (attempt_count BETWEEN 0 AND 5),
+  locked_at TIMESTAMPTZ,
+  locked_until TIMESTAMPTZ,
+  lock_token TEXT,
+  sent_at TIMESTAMPTZ,
+  provider_message_id TEXT,
+  failure_code TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CHECK (reply_id <> ''),
+  CHECK (idempotency_key <> ''),
+  CHECK ((locked_at IS NULL) = (lock_token IS NULL)),
+  CHECK ((locked_at IS NULL) = (locked_until IS NULL)),
+  CHECK (locked_until IS NULL OR locked_until > locked_at),
+  CHECK ((status = 'sending') = (locked_at IS NOT NULL)),
+  CHECK (status <> 'queued' OR attempt_count < 5),
+  CHECK (status <> 'sending' OR attempt_count BETWEEN 1 AND 5),
+  CHECK (status <> 'sent' OR sent_at IS NOT NULL),
+  CHECK (status <> 'failed' OR failure_code IS NOT NULL),
+  CHECK (sent_at IS NULL OR sent_at >= created_at)
+);
+
+CREATE INDEX IF NOT EXISTS chat_replies_dispatch_idx
+  ON chat_replies (broadcaster_user_id, not_before, created_at)
+  WHERE status = 'queued';
+
+CREATE INDEX IF NOT EXISTS chat_replies_expired_lock_idx
+  ON chat_replies (locked_until)
+  WHERE status = 'sending';
+
+-- Dispatcher locks this broadcaster row in the same transaction,
+-- checks the reply interval, updates last_reply_at, and sets not_before.
+CREATE TABLE IF NOT EXISTS chat_reply_rate_limits (
+  broadcaster_user_id TEXT PRIMARY KEY REFERENCES twitch_authorizations (broadcaster_user_id) ON DELETE CASCADE,
+  last_reply_at TIMESTAMPTZ NOT NULL
+);
+
+-- Related game state, cooldown, EventSub and outbox updates must be atomic.
+-- Lock twitch_authorizations before refresh-token rotation.
+CREATE OR REPLACE FUNCTION livemystery_set_updated_at()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  NEW.updated_at = NOW();
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS twitch_authorizations_set_updated_at ON twitch_authorizations;
+CREATE TRIGGER twitch_authorizations_set_updated_at
+  BEFORE UPDATE ON twitch_authorizations
+  FOR EACH ROW EXECUTE FUNCTION livemystery_set_updated_at();
+
+DROP TRIGGER IF EXISTS app_sessions_set_updated_at ON app_sessions;
+CREATE TRIGGER app_sessions_set_updated_at
+  BEFORE UPDATE ON app_sessions
+  FOR EACH ROW EXECUTE FUNCTION livemystery_set_updated_at();
+
+DROP TRIGGER IF EXISTS game_states_set_updated_at ON game_states;
+CREATE TRIGGER game_states_set_updated_at
+  BEFORE UPDATE ON game_states
+  FOR EACH ROW EXECUTE FUNCTION livemystery_set_updated_at();
+
+DROP TRIGGER IF EXISTS eventsub_subscriptions_set_updated_at ON eventsub_subscriptions;
+CREATE TRIGGER eventsub_subscriptions_set_updated_at
+  BEFORE UPDATE ON eventsub_subscriptions
+  FOR EACH ROW EXECUTE FUNCTION livemystery_set_updated_at();
+
+DROP TRIGGER IF EXISTS chat_replies_set_updated_at ON chat_replies;
+CREATE TRIGGER chat_replies_set_updated_at
+  BEFORE UPDATE ON chat_replies
+  FOR EACH ROW EXECUTE FUNCTION livemystery_set_updated_at();
+
+-- Cleanup must be implemented by a scheduled Function according to a retention policy.
+-- Expired outbox locks must be reclaimed or marked failed by the dispatcher.
