@@ -13,7 +13,7 @@
   "scripts": {
     "start": "node server/index.js",
     "dev": "node server/index.js",
-    "check": "node --check server/index.js && node --check server/game.js && node --check server/narration.js && node --check server/twitch.js && node --check server/database/config.js && node --check server/database/client.js && node --check server/database/migrations/runner.js && node --check server/database/repositories/game-state.js && node --check server/database/repositories/index.js && node --check public/app.js && node --check netlify/functions/health.mjs",
+    "check": "node --check server/index.js && node --check server/game.js && node --check server/narration.js && node --check server/twitch.js && node --check server/database/config.js && node --check server/database/client.js && node --check server/database/migrations/admin-auth.js && node --check server/database/migrations/http-handler.js && node --check server/database/migrations/runner.js && node --check server/database/repositories/game-state.js && node --check server/database/repositories/index.js && node --check public/app.js && node --check netlify/functions/health.mjs && node --check netlify/functions/migrate.mjs",
     "test": "node --test"
   }
 }
